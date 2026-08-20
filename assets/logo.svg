@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 105" width="100%" height="100%">
+  <!-- Main Tree Strokes -->
+  <g fill="none" stroke="#10b981" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round">
+    
+    <!-- Center Trunk -->
+    <path d="M 50 10 L 50 92" />
+
+    <!-- Left Root & Inner Diagonal Branch -->
+    <path d="M 24 10 C 24 28, 40 32, 40 50 L 24 82" />
+
+    <!-- Left Scalloped Canopy (3 Lobes) -->
+    <path d="M 40 50 C 25 45, 8 50, 18 64 C 5 75, 12 88, 24 82 C 22 96, 40 100, 50 92" />
+
+    <!-- Right Root & Right Scalloped Canopy -->
+    <path d="M 76 10 C 76 28, 60 32, 60 50 C 75 45, 92 50, 82 64 C 95 75, 88 88, 76 82 C 78 96, 60 100, 50 92" />
+
+    <!-- Right Inner Diagonal Branch (Connecting Center Trunk to Right Canopy) -->
+    <path d="M 50 58 L 76 82" />
+
+  </g>
+
+  <!-- The 3 Root Nodes (Input Dots at the top) -->
+  <g fill="#10b981">
+    <circle cx="50" cy="10" r="5.5" />
+    <circle cx="24" cy="10" r="5.5" />
+    <circle cx="76" cy="10" r="5.5" />
+  </g>
+</svg>
