@@ -1,18 +1,19 @@
 # Ramea Chat
 
-Every AI chat has the same hidden tax. Each turn re-sends your entire history
+A long AI chat can carry a hidden tax. Each turn often re-sends its history
 to the model, so the longer a conversation gets, the more you pay for old
-words you stopped caring about three topics ago, and the model spends more
-attention on that history and less on what you just asked.
+words you stopped caring about three topics ago, and unrelated messages can make the context harder to follow.
 
 Ramea fixes that with one structural change. Each conversation is a tree,
 not a transcript. You can branch an answer in a few directions, go deep in any
 one of them, and return to an earlier turn whenever you want. The model only
 ever receives the path of nodes you are currently following, so a deep
-conversation costs a fraction of a linear one and stays sharp while it grows.
+conversation can use less input than replaying every branch as one transcript.
 
 > Try it live without signing in: [https://www.ramea-chat.com/](https://www.ramea-chat.com/).
-> The demo is fully usable as a guest, so you can see the branching working before you create an account.
+> Open Ramea to browse the read-only demo and switch between its branches.
+> To chat with a model, create an account and connect your own OpenRouter key.
+> The application source is private; this repository explains the project and shares its evaluation suite.
 
 ## The problem it solves
 
@@ -20,9 +21,9 @@ Two related costs come with linear chat history.
 
 **Token cost.** You pay per token, and a normal chat resends your whole
 transcript (or at least a long cached prefix of it) on every single turn. The
-repeated prefix is billed at a discounted cache-read rate rather than full
-price, but it still grows with every message and is processed on every turn. A
-long history stays per-turn expensive whichever way you slice it.
+repeated prefix may qualify for a discounted cache-read rate, depending on the
+provider and model. Some systems also summarize or truncate history; the
+comparison here is with full-history replay.
 
 **Clutter and stagnation.** A long transcript is a wall of text. When you want
 to explore a different approach, the options are both bad. Starting a new chat
@@ -36,7 +37,9 @@ grows longer.
 Every message is a node in a tree. A new message continues the current thread
 as a child node, or forks into a branch of its own. The app sends the model
 only the ancestor path of the active message (root, then each node down to the
-current turn), never the whole conversation.
+current turn), excluding sibling branches. The visual tree groups each user
+question and assistant reply into one exchange; Branch is available on assistant
+messages. Deleting that exchange removes both messages and its descendants.
 
 ```mermaid
 flowchart LR
@@ -66,7 +69,7 @@ flowchart LR
 ```
 
 The gray arrows are branches you are not following. While you work along the
-yellow path they cost zero tokens and never pollute the answer.
+yellow path, the other branches add no input tokens to that request.
 
 ![Ramea tree view](assets/screenshot.png)
 
@@ -95,39 +98,42 @@ depth, not size. From the offline suite in this repo (detailed in
 - about 60% fewer input tokens on a deep turn (240 vs 589 tokens on an
   8-branch conversation),
 - roughly 3 times less input across a whole session (2,361 vs 6,713 tokens),
-- and the saving grows faster than linearly, since untouched branches are free
-  forever.
+- sibling branches add no input tokens to a request on another path.
 
-Fewer tokens means credits on the OpenRouter key stretch substantially further,
-per message, per conversation, every day.
+These are input-token measurements on the recorded example, not a promise of
+the same bill reduction for every conversation. Actual cost also depends on
+the model, output length and provider caching.
 
-One honest nuance: provider prompt caches discount repeated prefixes, which
-narrows the absolute gap to a linear chat at very large scale. Ramea does
-not depend on that. Its context slice is small to begin with, so it never needs
-a big cached prefix, and since branches share their upper nodes, a cached
-prefix stays reusable when you switch branches.
+One honest nuance: where provider caching applies, discounted repeated prefixes
+can narrow the price gap to a linear chat. Ramea does
+not depend on caching. Branches share earlier messages, so their common prefix
+may also be reusable where the provider supports it. A long active path can
+still be expensive; branching removes sibling context, not its own history.
 
 ### Better answers from focused context
 
 Long histories are expensive, and they add noise. A model reading an
 entire transcript guesses which of forty old messages still matter. The lineage
-approach keeps context compact and the active path unambiguous, reducing drift,
-hallucinations, and quietly degraded attention as a thread goes deep. The
-LLM-judged tests here verify it directly (Faithfulness 1.000 and zero sibling
-leakage on the recorded run).
+approach keeps the active path unambiguous. The recorded LLM-judged examples
+scored Faithfulness 1.000 and found no sibling leakage. Those are results for
+these test cases, not a guarantee against hallucinations or proof that every
+answer will improve.
 
 ### Conversations you can navigate
 
 Because every turn is a node, a conversation becomes a small map of ideas
 rather than a wall of text: fork in several directions, jump back to an earlier
-fork in one click, compare alternatives side by side, and return days later to
-pick up exactly where you left off. Unvisited branches cost nothing and stay
-saved, so the map reads less like a chat log and more like a plan that grew
-revisions instead of replacements.
+fork in one click, switch between alternatives, and return days later to
+pick up where you left off. The app restores your selected path after refresh.
+Saved branches stay available until deletion or temporary-message expiry, so
+the map reads less like a chat log and more like a plan that grew revisions
+instead of replacements.
 
 ## The AI engineering
 
-Every subsystem below is real and running in production.
+The sections below describe the deployed app. The public evaluation suite is
+self-contained: it tests token math and model behavior with representative
+branch context, without importing the private application source.
 
 ### Context engineering with one recursive CTE
 
@@ -137,13 +143,18 @@ up to the root to return exactly the branch being followed.
 
 ```text
 WITH RECURSIVE ancestors AS (
-    SELECT * FROM message_nodes WHERE id = :active
+    SELECT m.*, 0 AS depth FROM message_nodes m WHERE id = :active
     UNION ALL
-    SELECT m.* FROM message_nodes m
+    SELECT m.*, a.depth + 1 FROM message_nodes m
     JOIN ancestors a ON a.parent_id = m.id
+    WHERE m.conversation_id = a.conversation_id
 )
-SELECT * FROM ancestors ORDER BY created_at;
+SELECT * FROM ancestors ORDER BY depth DESC;
 ```
+
+This is a shortened example. The actual query also scopes the starting message
+to its owner and bounds traversal depth. Ordering by depth returns the path
+from root to active message.
 
 A LangGraph `load_context` step assembles that path into the prompt, so nothing
 in the client decides what the model sees. With the graph as the single source
@@ -176,15 +187,29 @@ sequenceDiagram
     end
     B->>M: stream completes
     B-->>F: data: {"done": true}
-    B->>B: persist node, background auto-title
+    F->>B: POST /messages/pair (completed exchange)
+    B->>B: persist user + assistant atomically
+    B-->>F: saved messages
+    B->>B: background title after first exchange
 ```
 
 Three decisions matter under real load: a producer/queue pattern decouples the
-model's async generator from the HTTP stream so back-pressure never stalls the
-response; a keepalive comment every 15 seconds while the model thinks stops
-proxies and browsers timing the connection out; and streaming runs through
+model's async generator from the HTTP stream; a keepalive comment every 15
+seconds while the model thinks helps prevent idle-proxy timeouts; and streaming runs through
 `ChatOpenAI.astream` over OpenRouter, so any catalog model works rather than one
-hard-coded provider.
+hard-coded provider. Requests are checked against the server catalog.
+
+The frontend saves a completed exchange after an explicit SSE completion event.
+User and assistant messages are saved together, with idempotent retries. An
+unexpected EOF is an interrupted reply, not a successful save. You can type
+your next draft or switch tree paths while a reply streams; Stop cancels it.
+
+After the first successful exchange, a background task requests a short title
+using the user's stored key. It sends at most 384 characters of the first prompt
+and requests at most 16 output tokens from a separately configured inexpensive
+model. History updates without a refresh. Normally there is one title request
+per conversation; failures retain the fallback and allow limited later attempts.
+Title generation does not hold up the chat response.
 
 ### A model catalog that stays current
 
@@ -198,25 +223,29 @@ any API key has been configured.
 Each user's OpenRouter key is stored encrypted at rest with Fernet, derived
 from an `API_KEY_SECRET` environment value. `GET /api-key` only ever returns
 `{ "hasKey": true }`; the key is resolved server-side on every chat request and
-never returned to the browser. A leaked database does not leak usable keys.
+never returned to the browser. Production requires a stable, externally
+configured encryption secret, kept separately from the database.
 
 ### Eval-driven development
 
 The claims above are not vibes. The repo ships an evaluation suite that checks
 two things. The efficiency tests measure the token math deterministically with
 OpenAI's tokenizer, offline and keyless. The quality tests generate real model
-answers through the same pipeline the app uses, then judge them with a second,
-stronger model via deepeval metrics: Faithfulness, Answer Relevancy,
+answers through OpenRouter from fixed branch-context fixtures, then judge
+them with the configured evaluation model through deepeval metrics:
+Faithfulness, Answer Relevancy,
 Contextual Relevancy, and a GEval check that sibling-branch facts never leak
 into an answer. The results are committed as a snapshot so the evidence is
 reviewable without running anything.
 
 ### Constraints that keep it reliable
 
-- an in-process rate limiter (sliding window, per IP and per user) so a noisy
-  client cannot run up the bill,
-- two-axis login throttling against credential stuffing,
-- bounded inputs and outputs everywhere, including message caps,
+- PostgreSQL-backed production rate budgets and concurrent-generation leases
+  shared across backend processes, with per-user hourly request caps,
+- Supabase email/password authentication and optional authenticator-app MFA,
+  with backend JWT issuer, audience, session and assurance-level validation,
+- server model validation, bounded context/output and generation deadlines,
+  plus conversation/message caps,
 - expired and temporary messages are pruned on read and by a background sweep,
 - cross-conversation and cross-user isolation enforced at the CTE level,
 - XSS-hardened rendering of model output (react-markdown with rehype-sanitize).
@@ -245,7 +274,7 @@ xychart-beta
     bar [589, 240]
 ```
 
-LLM-judged quality, recorded run with a free judge
+LLM-judged quality, recorded August 2026 run with the then-free judge
 (`openai/gpt-oss-20b:free`):
 
 | Check | Metric | Score | Verdict |
@@ -257,13 +286,14 @@ LLM-judged quality, recorded run with a free judge
 | System prompt is followed | GEval | 1.000 | PASS |
 
 The two halves are read together. Efficiency shows why it is cheap, quality
-shows that cheap is still correct. [`deepeval-tests/results.md`](deepeval-tests/results.md)
+checks grounding and branch isolation in the recorded examples. [`deepeval-tests/results.md`](deepeval-tests/results.md)
 explains the ratio-based Contextual Relevancy score.
 
 The offline half reproduces in one command:
 
 ```bash
-python -m pytest deepeval-tests -v
+pip install -r requirements.txt
+python -m pytest deepeval-tests -m efficiency -v
 ```
 
 The LLM-judged checks need an OpenRouter key and skip automatically without one.
@@ -286,21 +316,24 @@ flowchart LR
         GRAPH["LangGraph context"]
         SSE["SSE producer/queue, keepalive"]
         KEYS["Fernet key store"]
-        POLICE["Rate limiter + login throttling"]
+        POLICE["Shared quotas + generation leases"]
     end
     subgraph pg["Managed PostgreSQL"]
-        DB[("PostgreSQL 16<br/>SQLAlchemy 2 async · Alembic")]
+        DB[("PostgreSQL<br/>SQLAlchemy 2 async · Alembic")]
     end
     subgraph ext["External services"]
         OR["OpenRouter<br/>catalog + ChatOpenAI streaming"]
-        SENTRY["Sentry (optional)"]
+        AUTH["Supabase Auth<br/>email/password + optional MFA"]
+        SENTRY["Optional Sentry"]
     end
 
     BROWSER <--> FE
     FE <-->|"REST + SSE"| API
     API <--> DB
     API --> OR
-    API --> SENTRY
+    FE <--> AUTH
+    API --> AUTH
+    API -.-> SENTRY
     API --> GRAPH
     GRAPH --> SSE
     API <--> KEYS
@@ -309,30 +342,35 @@ flowchart LR
 
 How the services fit together:
 
-- Frontend: Next.js 16 on Vercel, with server and client components separated
-  and a proxying middleware injecting security headers and a CSP.
+- Frontend: Next.js 16 on Vercel. `/` is the public landing; `/app` is the
+  product. App providers, authentication and ReactFlow stay out of the landing
+  bundle. Middleware injects security headers and a CSP.
 - Backend: FastAPI on Render owning the tree queries, LangGraph context,
   encrypted key store, and SSE stream.
 - Data: managed PostgreSQL via async SQLAlchemy, migrated with Alembic before
   the backend starts.
-- Models: OpenRouter for the catalog and streaming; Sentry optionally captures
-  backend errors.
+- Authentication: Supabase owns passwords and sessions; the backend verifies
+  tokens and conversation ownership.
+- Models: OpenRouter for the catalog, streaming and inexpensive background
+  titles. Sentry reporting is optional and off unless explicitly enabled.
 - The same stack also runs fully self-hosted with Docker Compose (Postgres,
   backend, frontend, healthchecks, pinned base images).
 - CI runs backend tests against real Postgres, the offline efficiency suite,
-  dependency audit scans, and frontend lint, type-check, and production build.
+  production dependency audits, frontend tests, lint, type-check, production
+  build and landing bundle isolation.
 
 ## Data model
 
-Four tables carry the whole product. The lineage recursion lives in the
-self-referencing foreign key on `message_nodes`.
+The diagram shows the core application tables, not the full schema. Supabase
+handles authentication; the local user record links its identity to owned
+conversations and settings. Production quota buckets and generation leases
+live in separate tables. The ancestor query follows `message_nodes.parent_id`.
 
 ```mermaid
 erDiagram
     users {
         string id PK
         string email
-        string password_hash
     }
     conversations {
         string id PK
@@ -369,27 +407,30 @@ path of nodes is a branch, the same path the recursive CTE walks.
 | Layer | Tooling | Why |
 | --- | --- | --- |
 | Backend API | FastAPI, Uvicorn | async-first Python, typed, sane defaults |
-| Data | SQLAlchemy 2 async, asyncpg, Alembic, PostgreSQL 16 | recursive CTEs and clean migrations |
-| AI orchestration | LangGraph, LangChain (`ChatOpenAI`), OpenRouter | one graph for context and streaming, hundreds of models |
+| Data | SQLAlchemy 2 async, asyncpg, Alembic, PostgreSQL | recursive CTEs and clean migrations |
+| AI orchestration | LangGraph, LangChain (`ChatOpenAI`), OpenRouter | server-built branch context and OpenRouter streaming |
+| Authentication | Supabase Auth | email/password, sessions and optional TOTP MFA |
 | Cryptography | `cryptography` (Fernet) | API keys encrypted at rest |
 | Frontend | Next.js 16, TypeScript, React, Tailwind | App Router, strict types, security headers |
 | Graph UI | ReactFlow | the interactive tree canvas |
 | State and data | Zustand (persisted), TanStack Query | local-first UX and cached server state |
 | Rendering | react-markdown + rehype-sanitize | markdown from the model, rendered safely |
-| Testing | pytest, pytest-asyncio, deepeval, tiktoken | 246 backend tests plus the LLM-judged suite |
+| Testing | pytest, pytest-asyncio, Vitest, deepeval, tiktoken | 325 backend tests, 111 frontend tests and 4 offline efficiency tests at the MVP release, plus the recorded LLM suite |
 | Delivery | Vercel, Render, managed Postgres, GitHub Actions, Docker Compose | production + self-hosted + CI paths |
 
 ## What is in this repository
 
 ```
-public-repo/
+repository/
 ├── README.md              # this file
 ├── assets/                # logo.svg + screenshot.png (avatar, UI shot)
 └── deepeval-tests/        # the efficiency + quality proof suite, results.md included
 ```
 
-The product source stays private; the suite is included so every claim here is
-verifiable.
+The product source stays private. This repository includes the standalone
+evaluation suite and recorded results; the private backend/frontend regression
+tests are not included. The screenshot is illustrative and may predate the
+current interface.
 
 ## Built out of a real frustration
 
@@ -400,4 +441,6 @@ encrypted at rest, and tests that check the claims instead of vibes. This
 repository is the readable version of that work.
 
 
-© 2026 Ramea Chat. Released under the MIT License.
+© 2026 Ramea Chat. The materials and evaluation code in this repository are
+released under the MIT License. The private application source is not included
+or licensed by this repository.
